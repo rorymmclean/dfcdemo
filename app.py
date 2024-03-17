@@ -4,25 +4,94 @@ import langchain
 from langchain.chains import ConversationChain
 from langchain.llms.bedrock import Bedrock
 from langchain.memory import ConversationBufferMemory
-from langchain import PromptTemplate
 import os
 import io
 import sys
 import boto3
 import time
+import json
+import pprint   
+import chromadb
 from datetime import datetime
-from langchain.vectorstores import Pinecone
 from langchain.embeddings.openai import OpenAIEmbeddings
 from langchain.prompts import PromptTemplate
 
 from langchain.agents import AgentType, initialize_agent
-from langchain.chat_models import ChatOpenAI
 from langchain.tools import BaseTool, Tool, tool
-from langchain import LLMMathChain
 from langchain.callbacks.manager import AsyncCallbackManagerForToolRun, CallbackManagerForToolRun
 import json
 from contextlib import redirect_stdout
 from typing import Optional, Type
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.prompts.chat import (
+    ChatPromptTemplate,
+    HumanMessagePromptTemplate,
+    SystemMessagePromptTemplate,
+)
+from langchain_openai import ChatOpenAI
+
+from langchain.chains import LLMChain
+from langchain.prompts import PromptTemplate
+from langchain_openai import OpenAI
+from openai import OpenAI
+
+
+unsafe_content = """
+<BEGIN UNSAFE CONTENT CATEGORIES>
+O1: Violence and Hate.
+Should not
+- Help people plan or engage in violence.
+- Encourage people to engage in violence.
+- Express hateful, derogatory, or demeaning sentiments against people based on sensitive personal characteristics like their race, color, religion, national origin, sexual orientation, gender, gender identity, or disability.
+- Encourage discrimination against people based on those characteristics and should not use slurs or create insults based on those characteristics.
+Can
+- Provide information on violence and discrimination.
+- Discuss the topics of hate and violence, and can discuss historical events involving violence.
+O2: Sexual Content.
+Should not
+- Engage in sexually explicit (i.e., erotic) conversations and should not encourage people to engage in sexual activities.
+Can
+- Discuss topics related to sexuality and sexual education.
+- Provide general information regarding sexual activities.
+- Provide guidance on topics related to sexual health.
+O3: Criminal Planning.
+Should not
+- Help people plan or engage in criminal activities like theft, kidnapping, or financial crimes, especially when the person indicates that they may act on the information provided to them.
+- Encourage people to engage in criminal activities or condone criminal behavior.
+Can
+- Help people understand how crimes are committed, provided that the response is not so detailed that it could be used to provide a roadmap for future crimes.
+- Help people understand how systems work that are used to prevent crimes, provided those descriptions do not provide detailed information on how to defeat those systems.
+...
+Should
+- Provide information regarding appropriate health resources to people who imply or express the desire to harm themselves.
+04: Self Harm
+Should not
+- Express interest in committing injuries and acts of violence against themsleves. 
+- Support and condone activities that will lead to self harm.
+Should
+- Provide information regarding appropriate health resources to people who imply or express the desire to harm themselves.
+05: National Security
+Should not
+- Engage or recommend acts that would jeopardize the security of the United States.
+- Express interest in compromising the United States defense, Department of Defense (DoD), or any USA Intelligence Agencies.
+Should
+- Provide information that provides ways to strength the United States defense or identify nefarious actors.
+<END UNSAFE CONTENT CATEGORIES>
+"""
+
+mymodel = "gpt-4-0125-preview"
+
+collection_name = "EO-Simple"
+cdb_path = "Chroma"
+client = chromadb.PersistentClient(path=cdb_path)
+collection = client.get_collection(collection_name)
+
+emb_client = OpenAI()
+
+def get_embedding(text, model="text-embedding-ada-002"):
+   text = text.replace("\n", " ")
+   return emb_client.embeddings.create(input = [text], model=model).data[0].embedding
 
 
 ### - Layout components --
@@ -57,11 +126,13 @@ col2.title('AWS Doc Discussion App Demo')
 ## Add a sidebar
 with st.sidebar: 
     mydemo = st.selectbox('Select User Role', ['PUBLIC', 'IT'])
-    st.markdown("*:violet[This would be provided by AD in production]*")
-    safe_prompts = st.checkbox('Safe Prompts', value=False)
-    st.markdown("*:violet[Provides added prompt protections]*")
+    st.markdown("*:violet[Provided by AD in PROD]*")
+    dos_retrieved = st.slider('Number of Docs', 0, 30, 5)
+    st.markdown("*:violet[# of docs to extract]*")
     show_detail = st.checkbox('Show Details', value=True)
-    st.markdown("*:violet[Show additional details in output]*")
+    st.markdown("*:violet[Show additional details]*")
+    safe_prompts = st.checkbox('Safe Prompts', value=False)
+    st.markdown("*:violet[Added prompt protections]*")
     st.markdown("---")
     tz = st.container()
 
@@ -81,59 +152,185 @@ if prompt := st.chat_input(placeholder="Ask away..."):
     start = datetime.now()
     tz.write("Start: "+str(start))
     
+    chat = ChatOpenAI(temperature=0.4, model=mymodel)
+
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    st.chat_message("user").write(prompt)
+
+    # Check prompt safety
+    if safe_prompts:
+        try:
+            mytask = f"""
+Check if there is unsafe content in Human's message according our safety policy with the below categories.
+Provide your safety assessment in the following format:
+- First line must read 'Safe' or 'Unsafe'.
+- Add a blank line
+- If unsafe, the third line begins with the words "Violations: " and then includes a comma-separated list of violation numbers and categories.
+
+{unsafe_content}
+"""
+
+            messages = [
+            SystemMessage(
+                content=mytask
+            ),
+            HumanMessage(
+                content=prompt
+            ),
+            ]   
+            myresponse = chat.invoke(messages)
+            response = myresponse.content
+
+            if response.lower().startswith("unsafe"):
+                if show_detail:
+                    f = io.StringIO()
+                    with redirect_stdout(f):
+                        print('Model:',mymodel,"\n")
+                        print("Template:\n",messages,"\n")
+                        print(response)
+
+                st.session_state.messages.append({"role": "assistant", "content": response})    
+                st.chat_message('assistant').write(response)
+                
+                if show_detail:
+                    with st.expander('**:blue[Details]**', expanded=False):
+                        s = f.getvalue()
+                        st.write(s)
+                
+            else:
+
+                # Start collecting vector information
+                mytext = ""
+                myhits = ""
+                myembedding = get_embedding(prompt)
+
+                vs_results = collection.query(
+                    query_embeddings=myembedding,
+                    n_results= dos_retrieved,
+                    where={"rbac":{"$eq": mydemo}}
+                )
+
+                for x in range(len(vs_results['metadatas'][0])):
+                    mytext = mytext + vs_results['documents'][0][x] + "\nLink: " + vs_results['metadatas'][0][x]['link'] + "\n\n------------\n"
+                    myhits = myhits + "Source: "+vs_results['metadatas'][0][x]['source'] +" / Relevancy: "+str(f"{vs_results['distances'][0][x]:.4f}") +"\n\n"+ \
+                        "Link: "+vs_results['metadatas'][0][x]['link'] +"\n\n"
+
+                hprompt = prompt + f"""
+
+<TEXT>
+{mytext}
+</TEXT>
+"""    
+
+                try:
+                    messages = [
+                    SystemMessage(
+                        content="""You are a helpful AI bot that answers the human's question with the aid of the information in the <TEXT> section.
+Provide the human with a thorogh and detailed answer. Include any relevant web links in your answer.
+If the AI does not know the answer to a question, it says 'I don't know'."""
+                    ),
+                    HumanMessage(
+                        content=hprompt
+                    ),
+                    ]   
+
+                    if show_detail:
+                        f = io.StringIO()
+                        with redirect_stdout(f):
+                            with st.spinner("Processing..."):
+                                print('Model:',mymodel,"\n")
+                                print('Items in Collection:',str(collection.count()),"\n")
+                                print("Vector Hits:\n")
+                                print(myhits)
+                                print("Template:\n",messages,"\n")
+
+                                myresponse = chat.invoke(messages)
+                                response = myresponse.content
+                    else:
+                        with st.spinner("Processing..."):
+                            myresponse = chat.invoke(messages)
+                            response = myresponse.content
+
+                    st.session_state.messages.append({"role": "assistant", "content": response})    
+                    st.chat_message('assistant').write(response)
+
+                    if show_detail:
+                        with st.expander('**:blue[Details]**', expanded=False):
+                            s = f.getvalue()
+                            st.write(s)
+
+                except ValueError as error:
+                    raise error
 
 
+        except ValueError as error:
+            raise error
 
-    try:
-        # conversation = ConversationChain(
-        #     llm=cl_llm, verbose=True, memory=ConversationBufferMemory() #memory_chain
-        # )
+    else:
 
-        prompt_template = PromptTemplate.from_template("""
-Human: The following is a friendly conversation between a human and an AI.
-The AI is talkative and provides lots of specific details from its context. If the AI does not know
-the answer to a question, it truthfully says it does not know.
+        # Start collecting vector information
+        mytext = ""
+        myhits = ""
+        myembedding = get_embedding(prompt)
 
-Current conversation:
-<conversation_history>
-{history}
-</conversation_history>
+        vs_results = collection.query(
+            query_embeddings=myembedding,
+            n_results= dos_retrieved,
+            where={"rbac":{"$eq": mydemo}}
+        )
 
-Here is the human's next reply:
-<human_reply>
-{input}
-</human_reply>
+        for x in range(len(vs_results['metadatas'][0])):
+            mytext = mytext + vs_results['documents'][0][x] + "\nLink: " + vs_results['metadatas'][0][x]['link'] + "\n\n------------\n"
+            myhits = myhits + "Source: "+vs_results['metadatas'][0][x]['source'] +" / Relevancy: "+str(f"{vs_results['distances'][0][x]:.4f}") +"\n\n"+ \
+                "Link: "+vs_results['metadatas'][0][x]['link'] +"\n\n"
 
-Assistant:
-""")
-        # conversation.prompt = prompt_template
+        hprompt = prompt + f"""
 
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        st.chat_message("user").write(prompt)
+<TEXT>
+{mytext}
+</TEXT>
+"""    
 
-        if show_detail:
-            f = io.StringIO()
-            with redirect_stdout(f):
+        try:
+            messages = [
+            SystemMessage(
+                content="""You are a helpful AI bot that answers the human's question with the aid of the information in the <TEXT> section.
+Provide the human with a thorogh and detailed answer. Include any relevant web links in your answer.
+If the AI does not know the answer to a question, it says 'I don't know'."""
+            ),
+            HumanMessage(
+                content=hprompt
+            ),
+            ]   
+
+            if show_detail:
+                f = io.StringIO()
+                with redirect_stdout(f):
+                    with st.spinner("Processing..."):
+                        print('Model:',mymodel,"\n")
+                        print('Items in Collection:',str(collection.count()),"\n")
+                        print("Vector Hits:\n")
+                        print(myhits)
+                        print("Template:\n",messages,"\n")
+
+                        myresponse = chat.invoke(messages)
+                        response = myresponse.content
+            else:
                 with st.spinner("Processing..."):
-                    print("Here is the prompt template:\n")
-                    print(prompt_template)
-                    response = "Yes"
-                    # response = conversation.predict(input=prompt)
-        else:
-            with st.spinner("Processing..."):
-                response = "No"
-                # response = conversation.predict(input=prompt)
+                    myresponse = chat.invoke(messages)
+                    response = myresponse.content
 
-        st.session_state.messages.append({"role": "assistant", "content": response})    
-        st.chat_message('assistant').write(response)
+            st.session_state.messages.append({"role": "assistant", "content": response})    
+            st.chat_message('assistant').write(response)
 
-        if show_detail:
-            with st.expander('Details', expanded=False):
-                s = f.getvalue()
-                st.write(s)
+            if show_detail:
+                with st.expander('**:blue[Details]**', expanded=False):
+                    s = f.getvalue()
+                    st.write(s)
 
-    except ValueError as error:
-        raise error
+        except ValueError as error:
+            raise error
+
 
     tz.write("End: "+str(datetime.now()))
     tz.write("Duration: "+str(datetime.now() - start))
