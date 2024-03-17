@@ -1,0 +1,7 @@
+streamlit
+chromadb
+langchain
+langchain_core
+langchain_openai
+openai
+contextlib

@@ -1,41 +1,13 @@
 ### Imports
 import streamlit as st
-import langchain
-from langchain.chains import ConversationChain
-from langchain.llms.bedrock import Bedrock
-from langchain.memory import ConversationBufferMemory
-import os
 import io
-import sys
-import boto3
-import time
-import json
-import pprint   
 import chromadb
 from datetime import datetime
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.prompts import PromptTemplate
-
-from langchain.agents import AgentType, initialize_agent
-from langchain.tools import BaseTool, Tool, tool
-from langchain.callbacks.manager import AsyncCallbackManagerForToolRun, CallbackManagerForToolRun
-import json
+from langchain.callbacks.base import BaseCallbackHandler
 from contextlib import redirect_stdout
-from typing import Optional, Type
-
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_core.prompts.chat import (
-    ChatPromptTemplate,
-    HumanMessagePromptTemplate,
-    SystemMessagePromptTemplate,
-)
 from langchain_openai import ChatOpenAI
-
-from langchain.chains import LLMChain
-from langchain.prompts import PromptTemplate
-from langchain_openai import OpenAI
 from openai import OpenAI
-
 
 unsafe_content = """
 <BEGIN UNSAFE CONTENT CATEGORIES>
@@ -93,6 +65,14 @@ def get_embedding(text, model="text-embedding-ada-002"):
    text = text.replace("\n", " ")
    return emb_client.embeddings.create(input = [text], model=model).data[0].embedding
 
+class StreamHandler(BaseCallbackHandler):
+    def __init__(self, container, initial_text=""):
+        self.container = container
+        self.text = initial_text
+
+    def on_llm_new_token(self, token: str, **kwargs) -> None:
+        self.text += token
+        self.container.markdown(self.text)
 
 ### - Layout components --
 ## I put these at the top because Streamlit runs from the top down and 
@@ -125,9 +105,9 @@ col1.image('AderasBlue2.png', width=70)
 col2.title('AWS Doc Discussion App Demo')
 ## Add a sidebar
 with st.sidebar: 
-    mydemo = st.selectbox('Select User Role', ['PUBLIC', 'IT'])
+    mydemo = st.selectbox('Select User Role', ['General', 'Cyber'])
     st.markdown("*:violet[Provided by AD in PROD]*")
-    dos_retrieved = st.slider('Number of Docs', 0, 30, 5)
+    docs_retrieved = st.slider('Number of Docs', 0, 30, 5)
     st.markdown("*:violet[# of docs to extract]*")
     show_detail = st.checkbox('Show Details', value=True)
     st.markdown("*:violet[Show additional details]*")
@@ -203,11 +183,15 @@ Provide your safety assessment in the following format:
                 mytext = ""
                 myhits = ""
                 myembedding = get_embedding(prompt)
+                if mydemo == 'Cyber':
+                    mycategories = ["PUBLIC","IT"]
+                else:    
+                    mycategories = ["PUBLIC"]
 
                 vs_results = collection.query(
                     query_embeddings=myembedding,
-                    n_results= dos_retrieved,
-                    where={"rbac":{"$eq": mydemo}}
+                    n_results= docs_retrieved,
+                    where={"rbac":{"$in": mycategories}}
                 )
 
                 for x in range(len(vs_results['metadatas'][0])):
@@ -226,8 +210,10 @@ Provide your safety assessment in the following format:
                     messages = [
                     SystemMessage(
                         content="""You are a helpful AI bot that answers the human's question with the aid of the information in the <TEXT> section.
-Provide the human with a thorogh and detailed answer. Include any relevant web links in your answer.
-If the AI does not know the answer to a question, it says 'I don't know'."""
+Provide the human with a thorogh and detailed answer. 
+If you used information from the <TEXT> section, you MUST include any relevant web links in your answer.
+If the <TEXT> does not help answer the human's question, you MUST first indicate that "The provided documents did not assist with answering the question." but try to answer if possible.
+If the AI does not know the answer to a human's question, then say 'I don't know'."""
                     ),
                     HumanMessage(
                         content=hprompt
@@ -244,15 +230,21 @@ If the AI does not know the answer to a question, it says 'I don't know'."""
                                 print(myhits)
                                 print("Template:\n",messages,"\n")
 
-                                myresponse = chat.invoke(messages)
-                                response = myresponse.content
+                                with st.chat_message("assistant"):
+                                    stream_handler = StreamHandler(st.empty())
+                                    llm = ChatOpenAI(temperature=0.4, model=mymodel,  streaming=True, callbacks=[stream_handler])
+                                    stream_handler = StreamHandler(st.empty())
+                                    response = llm(messages)
+
                     else:
                         with st.spinner("Processing..."):
-                            myresponse = chat.invoke(messages)
-                            response = myresponse.content
+                            with st.chat_message("assistant"):
+                                stream_handler = StreamHandler(st.empty())
+                                llm = ChatOpenAI(temperature=0.4, model=mymodel,  streaming=True, callbacks=[stream_handler])
+                                stream_handler = StreamHandler(st.empty())
+                                response = llm(messages)
 
-                    st.session_state.messages.append({"role": "assistant", "content": response})    
-                    st.chat_message('assistant').write(response)
+                    st.session_state.messages.append({"role": "assistant", "content": response.content})    
 
                     if show_detail:
                         with st.expander('**:blue[Details]**', expanded=False):
@@ -272,11 +264,15 @@ If the AI does not know the answer to a question, it says 'I don't know'."""
         mytext = ""
         myhits = ""
         myembedding = get_embedding(prompt)
+        if mydemo == 'Cyber':
+            mycategories = ["PUBLIC","IT"]
+        else:    
+            mycategories = ["PUBLIC"]
 
         vs_results = collection.query(
             query_embeddings=myembedding,
-            n_results= dos_retrieved,
-            where={"rbac":{"$eq": mydemo}}
+            n_results= docs_retrieved,
+            where={"rbac":{"$in": mycategories}}
         )
 
         for x in range(len(vs_results['metadatas'][0])):
@@ -313,15 +309,20 @@ If the AI does not know the answer to a question, it says 'I don't know'."""
                         print(myhits)
                         print("Template:\n",messages,"\n")
 
-                        myresponse = chat.invoke(messages)
-                        response = myresponse.content
+                        with st.chat_message("assistant"):
+                            stream_handler = StreamHandler(st.empty())
+                            llm = ChatOpenAI(temperature=0.4, model=mymodel,  streaming=True, callbacks=[stream_handler])
+                            stream_handler = StreamHandler(st.empty())
+                            response = llm(messages)
             else:
                 with st.spinner("Processing..."):
-                    myresponse = chat.invoke(messages)
-                    response = myresponse.content
+                    with st.chat_message("assistant"):
+                        stream_handler = StreamHandler(st.empty())
+                        llm = ChatOpenAI(temperature=0.4, model=mymodel,  streaming=True, callbacks=[stream_handler])
+                        stream_handler = StreamHandler(st.empty())
+                        response = llm(messages)
 
-            st.session_state.messages.append({"role": "assistant", "content": response})    
-            st.chat_message('assistant').write(response)
+            st.session_state.messages.append({"role": "assistant", "content": response.content})    
 
             if show_detail:
                 with st.expander('**:blue[Details]**', expanded=False):
